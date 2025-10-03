@@ -75,30 +75,69 @@ from datetime import datetime, timezone
 ENSEMBLE_BASE_URL = os.getenv("ENSEMBLE_BASE_URL", "https://api.ensembledata.com")
 ENSEMBLE_API_KEY = os.getenv("ENSEMBLE_API_KEY")
 
+# Ensemble TikTok Keyword Full Search (correct auth + path)
+ENSEMBLE_BASE_URL = os.getenv("ENSEMBLE_BASE_URL", "https://ensembledata.com/apis")
+ENSEMBLE_API_KEY = os.getenv("ENSEMBLE_API_KEY")  # set in Replit Secrets
+BRAND_KEYWORD = os.getenv("BRAND_KEYWORD", "brandx")  # optional default for engine mode
+
 def fetch_videos_from_ensemble(market: str, since: datetime, until: datetime) -> List[Video]:
     """
-    Real Ensemble Data API call.
-    Adjust endpoint/params/field names to match your tenant’s spec.
-    Supports simple pagination via 'next' cursor if provided.
+    Uses /tt/keyword/full-search which auto-paginates and authenticates via ?token=.
+    The API takes a 'period' in DAYS (1, 7, 30...), not since/until timestamps.
     """
-    if ENSEMBLE_API_KEY is None:
+    if not ENSEMBLE_API_KEY:
         raise RuntimeError("Missing ENSEMBLE_API_KEY secret.")
 
-    headers = {
-        "Authorization": f"Bearer {ENSEMBLE_API_KEY}",
-        "Accept": "application/json",
+    # Map your market to Ensemble's 'country' param (adjust as needed)
+    country = {"US": "us", "UK": "uk"}.get(market, "us")
+
+    # Convert your time window into 'period' days for the API
+    period_days = max(1, round((until - since).total_seconds() / 86400)) or 1
+
+    url = f"{ENSEMBLE_BASE_URL}/tt/keyword/full-search"
+    params = {
+        "name": BRAND_KEYWORD,     # if you want per-search brand, pass it in elsewhere
+        "period": period_days,     # 1, 7, 30, ...
+        "sorting": 0,              # 0=relevance, 1=most liked (per docs)
+        "country": country,        # 'us','uk',...
+        "match_exactly": "false",
+        "token": ENSEMBLE_API_KEY, # <-- auth via query param (NOT Authorization header)
     }
 
-    # Example endpoint/params — tweak to match your API:
-    url = f"{ENSEMBLE_BASE_URL}/tiktok/videos"
-    params = {
-        "market": market,
-        "since": since.replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z"),
-        "until": until.replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z"),
-        "limit": 200,  # adjust per API limits
-        # Optional: filters for hashtags/sounds/keywords if supported
-        # "q": "brandx OR brandy",
-    }
+    r = requests.get(url, params=params, headers={"Accept": "application/json"}, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+
+    items = data.get("posts") or data.get("data") or []
+    out: List[Video] = []
+    for v in items:
+        # timestamps can be epoch or iso; normalize
+        created_at = v.get("createTime") or v.get("created_at") or v.get("timestamp")
+        if isinstance(created_at, (int, float)):
+            ts = datetime.fromtimestamp(int(created_at), tz=timezone.utc)
+        else:
+            ts = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")) if created_at else datetime.now(timezone.utc)
+
+        hashtags = [("#" + h.lstrip("#")).lower() for h in (v.get("hashtags") or [])]
+
+        out.append(Video(
+            id=str(v.get("id") or v.get("video_id") or v.get("aweme_id")),
+            caption=v.get("desc") or v.get("caption") or "",
+            creator_id=str(v.get("author", {}).get("uniqueId") or v.get("author_id") or v.get("uid") or "unknown"),
+            creator_followers=int(v.get("authorStats", {}).get("followerCount") or v.get("followers") or 0),
+            views=int(v.get("stats", {}).get("playCount") or v.get("playCount") or v.get("views") or 0),
+            likes=int(v.get("stats", {}).get("diggCount") or v.get("likes") or 0),
+            shares=int(v.get("stats", {}).get("shareCount") or v.get("shares") or 0),
+            comments=int(v.get("stats", {}).get("commentCount") or v.get("comments") or 0),
+            sound_id=(v.get("music", {}) or {}).get("id") or v.get("musicId"),
+            effect_id=v.get("effectId") or None,
+            hashtags=hashtags,
+            market=market,
+            ts=ts.replace(tzinfo=None),  # store as naive UTC to match the rest of your code
+        ))
+
+    return out
+
 
     out: List[Video] = []
     next_cursor = None
